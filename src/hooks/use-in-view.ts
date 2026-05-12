@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-export function useInView<T extends HTMLElement = HTMLDivElement>(
+export function useInView<T extends Element = HTMLDivElement>(
   options: IntersectionObserverInit = { threshold: 0.2, rootMargin: "0px 0px -10% 0px" }
 ) {
   const ref = useRef<T | null>(null);
