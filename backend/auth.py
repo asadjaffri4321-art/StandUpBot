@@ -27,9 +27,19 @@ def get_current_user(request: Request):
         user_id = serializer.loads(token, max_age=COOKIE_MAX_AGE)
     except BadSignature:
         return None
-    db = next(get_db())
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return dict(user) if user else None
+    
+    # Use a fresh database connection
+    import sqlite3
+    from pathlib import Path
+    DB_PATH = Path(__file__).parent / "standupbot.db"
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(user) if user else None
+    finally:
+        conn.close()
 
 
 def require_user(request: Request):
@@ -55,45 +65,76 @@ def google_login():
 
 
 @router.get("/auth/google/callback")
-async def google_callback(code: str, request: Request, response: Response):
-    token_resp = await _exchange_code(code)
-    user_info = await _fetch_user_info(token_resp["access_token"])
+async def google_callback(code: str, request: Request):
+    try:
+        token_resp = await _exchange_code(code)
+        
+        if "error" in token_resp:
+            return RedirectResponse(url="http://localhost:8080/?error=oauth_failed")
+        
+        if "access_token" not in token_resp:
+            print(f"Token response: {token_resp}")
+            return RedirectResponse(url="http://localhost:8080/?error=no_access_token")
+        
+        user_info = await _fetch_user_info(token_resp["access_token"])
+    except Exception as e:
+        print(f"OAuth error: {e}")
+        return RedirectResponse(url="http://localhost:8080/?error=oauth_exception")
 
-    db = next(get_db())
+    # Use a fresh database connection
+    import sqlite3
+    from pathlib import Path
+    DB_PATH = Path(__file__).parent / "standupbot.db"
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        existing = conn.execute("SELECT * FROM users WHERE email = ?", (user_info["email"],)).fetchone()
 
-    existing = db.execute("SELECT * FROM users WHERE email = ?", (user_info["email"],)).fetchone()
+        if existing:
+            user_id = existing["id"]
+            conn.execute(
+                "UPDATE users SET name = ?, avatar_url = ? WHERE id = ?",
+                (user_info.get("name", ""), user_info.get("picture", ""), user_id),
+            )
+        else:
+            cursor = conn.execute(
+                "INSERT INTO users (email, name, avatar_url) VALUES (?, ?, ?)",
+                (user_info["email"], user_info.get("name", ""), user_info.get("picture", "")),
+            )
+            user_id = cursor.lastrowid
 
-    if existing:
-        user_id = existing["id"]
-        db.execute(
-            "UPDATE users SET name = ?, avatar_url = ? WHERE id = ?",
-            (user_info.get("name", ""), user_info.get("picture", ""), user_id),
-        )
-    else:
-        cursor = db.execute(
-            "INSERT INTO users (email, name, avatar_url) VALUES (?, ?, ?)",
-            (user_info["email"], user_info.get("name", ""), user_info.get("picture", "")),
-        )
-        user_id = cursor.lastrowid
+            conn.execute(
+                "UPDATE project_members SET user_id = ? WHERE email = ? AND user_id IS NULL",
+                (user_id, user_info["email"]),
+            )
 
-        db.execute(
-            "UPDATE project_members SET user_id = ? WHERE email = ? AND user_id IS NULL",
-            (user_id, user_info["email"]),
-        )
-
-    db.commit()
+        conn.commit()
+    finally:
+        conn.close()
 
     token = serializer.dumps(user_id)
-    response = RedirectResponse(url="/dashboard")
-    response.set_cookie(COOKIE_NAME, token, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax")
+    response = RedirectResponse(url="http://localhost:8080/dashboard")
+    response.set_cookie(
+        COOKIE_NAME, 
+        token, 
+        max_age=COOKIE_MAX_AGE, 
+        httponly=True, 
+        samesite="lax",
+        domain="localhost"
+    )
     return response
 
 
 @router.post("/auth/logout")
-def logout():
-    response = RedirectResponse(url="/")
-    response.delete_cookie(COOKIE_NAME)
-    return response
+def logout(response: Response):
+    response.delete_cookie(
+        COOKIE_NAME,
+        domain="localhost",
+        httponly=True,
+        samesite="lax"
+    )
+    return {"ok": True}
 
 
 async def _exchange_code(code: str) -> dict:
